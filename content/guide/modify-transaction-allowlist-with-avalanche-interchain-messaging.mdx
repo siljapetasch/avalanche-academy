@@ -1,0 +1,282 @@
+---
+title: Send a one-time payment to gain access to a permissioned Avalanche L1
+description: This guide shows how to deploy a smart contract on the C-Chain that is then responsible for managing the transaction allowlist of a permissioned avalanche L1.
+date: 2024-07-24
+authors: [siljapetasch]
+topics: [solidity, foundry, Avalanche Starter Kit, avalanche interchain messaging, precomiles, Customise the EVM]
+---
+
+## Recommended Knowledge
+
+- Basic understanding of Solidity and Avalanche
+- You are familiar with Avalanche Interchain Messaging & Transaction Allowlist Precompile
+- Basic understanding of the Avalanche's architecture
+
+## What we have to do
+
+1. Create an avalanche L1 (with the transaction allowlist precompile enabled)
+2. Deploy the avalanche L1 on local network
+3. Deploy the managing receiver on the avalanche L1
+4. Deploy the sender contract on the c-chain
+5. Add Managing Receiver Contract as Manager of the Transaction Allowlist
+6. Send message from the Sender Contract to the Receiver Contract from C-Chain
+7. Check if address was added to Allowlist
+
+## Local Network Environment
+
+import SetUp from "@/content/common/avalanche-starter-kit/set-up.mdx";
+
+<SetUp />
+
+## 1. Create an Avalanche L1
+
+To get started, create an Avalanche L1 configuration named "mysubnet":
+```
+avalanche subnet create mysubnet
+```
+
+Configure the avalanche L1 and enable avalanche interchain messaging (prv. teleporter), AWM Relayer and Transaction Allowlist Precompile:
+```
+✔ Use latest release version
+✔ Yes
+✔ Yes
+Installing subnet-evm-v0.6.6...
+subnet-evm-v0.6.6 installation successful
+creating genesis for subnet mySubnet
+Enter your subnet's ChainId. It can be any positive integer.
+ChainId: 24
+Select a symbol for your subnet's native token
+Token symbol: ETHCC
+✔ Low disk use    / Low Throughput    1.5 mil gas/s (C-Chain's setting)
+✔ Airdrop 1 million tokens to the default ewoq address (do not use in production)
+prefunding address 0x8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC with balance 1000000000000000000000000
+
+? Advanced: Would you like to add a custom precompile to modify the EVM?: 
+    No
+▸ Yes
+    Go back to previous step
+
+prefunding address 0x8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC with balance 1000000000000000000000000
+✔ Yes
+
+? Choose precompile: 
+    Native Minting
+    Contract Deployment Allow List
+▸ Transaction Allow List
+    Adjust Fee Settings Post Deploy
+    Customize Fees Distribution
+    Cancel
+✔ Transaction Allow List
+
+? Configure the addresses that are allowed to issue transactions: 
+▸ Add an address for a role to the allow list
+    Preview Allow List
+    Confirm Allow List
+    Cancel
+✔ Add an address for a role to the allow list
+
+? What role should the address have?: 
+▸ Admin
+    Manager
+    Enabled
+    Explain the difference
+    Cancel
+✔ Admin
+
+✔ Enter the address of the account (or multiple comma separated): 0x8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC
+
+? Configure the addresses that are allowed to issue transactions: 
+    Add an address for a role to the allow list
+    Remove address from the allow list
+    Preview Allow List
+▸ Confirm Allow List
+    Cancel
+✔ Confirm Allow List
++---------+--------------------------------------------+
+| Admins  | 0x8db97C7cEcE249c2b98bDC0226Cc4C2A57BF52FC |
++---------+--------------------------------------------+
+| Manager |                                            |
++---------+--------------------------------------------+
+| Enabled |                                            |
++---------+--------------------------------------------+
+
+? Confirm?: 
+▸ Yes
+    No, keep editing
+✔ Yes
+
+? Would you like to add additional precompiles?: 
+▸ No
+    Yes
+    Go back to previous step
+✓ Successfully created subnet configuration
+```
+
+## 2. Deploy avalanche L1 on Local Network
+
+```
+avalanche subnet deploy mysubnet
+```
+
+## 3. Deploy the Managing Reiceiver Contract on the avalanche L1
+
+Create the file ```receiverOnSubnet.sol``` in the src folder. Copy-Paste the following smart contract.
+
+```
+// (c) 2023, Ava Labs, Inc. All rights reserved.
+// See the file LICENSE for licensing terms.
+
+// SPDX-License-Identifier: Ecosystem
+
+pragma solidity ^0.8.18;
+
+import "@teleporter/ITeleporterMessenger.sol";
+import "@teleporter/ITeleporterReceiver.sol";
+import "./txAllowList.sol";
+
+contract ReceiverOnSubnet is ITeleporterReceiver {
+    ITeleporterMessenger public immutable messenger = ITeleporterMessenger(0x253b2784c75e510dD0fF1da844684a1aC0aa5fcf);
+
+    IAllowList txAllowList = IAllowList(0x0200000000000000000000000000000000000002);
+
+    string public lastMessage;
+
+    function receiveTeleporterMessage(bytes32, address, bytes calldata message) external {
+        // Only the Teleporter receiver can deliver a message.
+        require(msg.sender == address(messenger), "ReceiverOnSubnet: unauthorized TeleporterMessenger");
+
+        // Store the message.
+        address newParticipant = abi.decode(message, (address));
+
+        txAllowList.setEnabled(newParticipant);
+    }
+}
+```
+
+To deploy the contract, run:
+```
+forge create --rpc-url mysubnet --private-key $PK src/receiverOnSubnet.sol:ReceiverOnSubnet
+```
+
+Export the contract address as a local variable:
+```
+export RECEIVER_CONTRACT=0x52C84043CD9c865236f11d9Fc9F56aa003c1f922
+```
+    
+## 4. Deploy the Sender Contract on the C-Chain
+
+Create the file ```senderOnCChainFee.sol``` in the src folder. Copy-Paste the following smart contract.
+
+```
+// (c) 2023, Ava Labs, Inc. All rights reserved.
+// See the file LICENSE for licensing terms.
+
+// SPDX-License-Identifier: Ecosystem
+
+pragma solidity ^0.8.18;
+
+import "@teleporter/ITeleporterMessenger.sol";
+
+contract SenderOnCChainFee {
+    ITeleporterMessenger public immutable messenger = ITeleporterMessenger(0x253b2784c75e510dD0fF1da844684a1aC0aa5fcf);
+    uint256 public constant FEE_AMOUNT = 0.02 ether; // Define the fee amount
+    address public owner; // Contract owner
+
+    constructor() {
+        owner = msg.sender; // Set the contract deployer as the owner
+    }
+
+    /**
+     * @dev Sends a message to another chain.
+     * Requires the caller to pay a one-time fee.
+     */
+    function sendMessage() external payable {
+        require(msg.value >= FEE_AMOUNT, "Insufficient fee");
+
+        // Forward the fee to the owner
+        (bool sent,) = owner.call{value: msg.value}("");
+        require(sent, "Failed to send Ether");
+
+        messenger.sendCrossChainMessage(
+            TeleporterMessageInput({
+                // Replace with blockchainID of your Subnet (see instructions in Readme)
+                destinationBlockchainID: 0x216f92e177e22daa815811e6de0ce269e447dba4fcc3af60eb8a4c53caf121aa,
+                destinationAddress: 0x52C84043CD9c865236f11d9Fc9F56aa003c1f922,
+                feeInfo: TeleporterFeeInfo({feeTokenAddress: address(0), amount: 0}),
+                requiredGasLimit: 1000000,
+                allowedRelayerAddresses: new address[](0),
+                message: abi.encode(msg.sender)
+            })
+        );
+    }
+
+    /**
+     * @dev Allows the owner to withdraw Ether from the contract.
+     */
+    function withdraw() external {
+        require(msg.sender == owner, "Only owner can withdraw");
+        (bool sent,) = owner.call{value: address(this).balance}("");
+        require(sent, "Failed to send Ether");
+    }
+}
+```
+
+To deploy the contract, run:
+```
+forge create --rpc-url local-c --private-key $PK src/senderOnCChainFee.sol:SenderOnCChainFee
+```
+
+Export the contract address as a local variable:
+```
+export SENDER_CONTRACT=0xA4cD3b0Eb6E5Ab5d8CE4065BcCD70040ADAB1F00
+```
+
+
+## 5. Give the Managing Reiceiver Contract the role of Manager of the Transaction Allowlist
+
+Set the Receiver Contract as the manager of the transaction allowlist
+```
+cast send --rpc-url mysubnet --private-key $PK 0x0200000000000000000000000000000000000002 "setManager(address)" $RECEIVER_CONTRACT
+```
+
+Check to see if the the Receiver Contract has been added to the allowlist
+```
+cast call --rpc-url mysubnet --private-key $PK 0x0200000000000000000000000000000000000002 "readAllowList(address)" $RECEIVER_CONTRACT
+```
+
+Should return:
+```0x0000000000000000000000000000000000000000000000000000000000000003``` for admin  ```0x0000000000000000000000000000000000000000000000000000000000000002``` for manager
+```0x0000000000000000000000000000000000000000000000000000000000000001``` for enabled
+
+
+## 6. Send message from the Sender Contract to the Receiver Contract from C-Chain
+
+### Create a new wallet
+To create a new keypair, run: ```cast wallet new```
+
+```
+Successfully created new keypair.
+Address:     0xe22187fC2aFb7590cB1dd18877f7BEDFAE2A7675
+Private key: 0x6f45447747cf70bd3b494f5cff8283997bd70b085aca8577bd716ef5bb600496
+```
+
+
+### Fund new wallet from eqoq address
+
+```
+cast send --rpc-url local-c --private-key $PK 0xe22187fC2aFb7590cB1dd18877f7BEDFAE2A7675 --value 1ether
+```
+
+
+### Send Message to Sender Contract with fee
+
+```
+cast send --rpc-url local-c --private-key 0x6f45447747cf70bd3b494f5cff8283997bd70b085aca8577bd716ef5bb600496 $SENDER_CONTRACT "sendMessage()" --value 0.03ether
+```
+
+
+## 7. Check if Adress was added to Allowlist
+
+```
+cast call --rpc-url mysubnet --private-key $PK 0x0200000000000000000000000000000000000002 "readAllowList(address)" 0xe22187fC2aFb7590cB1dd18877f7BEDFAE2A7675
+```
